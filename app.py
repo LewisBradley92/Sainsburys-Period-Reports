@@ -246,6 +246,12 @@ def rows_from_source(audit_df, order_df, period_num, report_name, start_date, en
     out = pd.DataFrame()
     for c in columns:
         out[c] = audits[c] if c in audits.columns else None
+    # Q26 is a per-audit result, not a constant template marker. Populate it
+    # from the audit export so failed audits remain failed in Period and YTD.
+    out["Basic No ID logic (Q26)"] = (
+        audits["primary_result"].astype("string").str.strip().str.lower()
+        if "primary_result" in audits.columns else pd.Series(pd.NA, index=audits.index, dtype="string")
+    )
     for c in ["submitted_date","approval_date","date_of_visit"]:
         out[c] = pd.to_datetime(out[c], errors="coerce", dayfirst=True)
     out["site_code"] = out["site_code"].apply(numeric_site_code)
@@ -263,10 +269,10 @@ def merge_ytd(existing_df, incoming_df):
     return all_rows.drop(columns=["__visit_sort","__order"], errors="ignore").reset_index(drop=True)
 
 def extract_existing_ytd(ws):
-    headers = [ws.cell(1,c).value for c in range(1,15)]
+    headers = [ws.cell(1,c).value for c in range(1,16)]
     rows=[]
     for r in range(2, ws.max_row+1):
-        vals=[ws.cell(r,c).value for c in range(1,15)]
+        vals=[ws.cell(r,c).value for c in range(1,16)]
         if any(v is not None for v in vals) and vals[2] is not None:
             rows.append(vals)
     return pd.DataFrame(rows, columns=headers)
@@ -436,7 +442,7 @@ if start_date > end_date:
 fast_mode = st.checkbox(
     "Fast mode — skip slow cloud recalculation",
     value=True,
-    help="Avoids the slow LibreOffice recalculation stage. Formulas are retained and Excel recalculates when opened. The app also restores helper formulas on the first data row, which were previously being cleared."
+    help="Avoids the slow LibreOffice recalculation stage. Formulas are retained and Excel recalculates when opened. Q26 pass/fail values are written from each audit's primary_result."
 )
 
 if st.button("Build all 3 LIVE reports (3 files)", type="primary", disabled=not all([argos_file,super_file,conv_file,audit_file,order_file,calendar_file,sains_master_file,argos_master_file]) or start_date>end_date):
@@ -475,8 +481,8 @@ if st.button("Build all 3 LIVE reports (3 files)", type="primary", disabled=not 
                 period_ws=wb["Period Input"]; ytd_ws=wb["YTD Input"]
                 existing=extract_existing_ytd(ytd_ws)
                 new_ytd=merge_ytd(existing,period_rows)
-                write_input_rows(period_ws,period_rows,14)
-                write_input_rows(ytd_ws,new_ytd,14)
+                write_input_rows(period_ws,period_rows,15)
+                write_input_rows(ytd_ws,new_ytd,15)
                 # Refresh order lists if a compatible three-column list exists.
                 report_orders=valid_orders[valid_orders["__category"]==report_name]
                 input_order_count = update_input_orders(wb["Input"], report_orders)

@@ -1,21 +1,9 @@
-# Sainsbury's / Argos Periodic Reporting App
+# Sainsbury's / Argos / Convenience Period Reporting App
 
-## What it does
-- Generates Argos, Supermarket and Convenience reports from the three LIVE templates.
-- Uses `order_export.csv` `order_info` prefixes such as `P8 - Argos - Knife`, `P8 - Supermarket - Tobacco`, and `P8 - Convenience - E-cig` to allocate orders.
-- Excludes Compliance Audit, Date Check, Mystery Shop and Petrol/Diesel.
-- Refreshes `Period Input`, appends/updates `YTD Input` by audit `internal_id`, keeping the latest date of visit for duplicate audit IDs.
-- Produces LIVE and client-facing versions of each report, plus a ZIP containing all six.
+Streamlit app that updates the three LIVE reporting workbooks for Argos, Supermarket and Convenience.
 
-## Run locally
-Python 3.10+ recommended.
+## Important Q26 pass/fail fix
+The `Basic No ID logic (Q26)` column in Period Input and YTD Input is now populated per audit from the source audit export's `primary_result` (`pass`, `fail`, or `abort`) instead of copying the template's first-row literal `pass` marker to every row. This prevents failed audits from being incorrectly counted as passes.
 
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-LibreOffice Calc is required for reliable formula recalculation before converting formulas to values in client-facing workbooks. The `packages.txt` file installs `libreoffice-calc` on Streamlit Community Cloud. Commit `packages.txt` and redeploy; allow the first build to finish installing the system package.
-
-## Important
-The reporting period dates are entered manually in the UI for each run. Confirm the dates against the uploaded Sainsbury's calendar. This avoids assuming a calendar structure if the calendar layout changes.
+## Run
+Deploy `app.py` on Streamlit Community Cloud with `requirements.txt` and `packages.txt`. Fast mode skips cloud formula recalculation; open LIVE workbooks in Excel to recalculate formulas before using report figures.
