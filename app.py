@@ -84,7 +84,8 @@ def sync_regions_tab(wb, report_name, master_upload, argos_master_upload):
             deduped.append(rec)
     for r, rec in enumerate(deduped, start=2):
         for c, val in enumerate(rec, start=1):
-            ws.cell(r, c).value = val
+            code_col = 1 if report_name == "Argos" else (2 if report_name == "Supermarket" else 3)
+            ws.cell(r, c).value = numeric_site_code(val) if c == code_col else val
         if r > 2:
             for c in range(1, 5):
                 ws.cell(r,c)._style = copy(ws.cell(2,c)._style)
@@ -97,6 +98,28 @@ def read_csv_upload(upload):
 
 def norm(v):
     return re.sub(r"\s+", " ", str(v or "")).strip().casefold()
+
+def numeric_site_code(value):
+    """Store numeric-looking site codes as numbers for Excel lookups."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) if isinstance(value, float) and value.is_integer() else value
+    text = str(value).strip()
+    if re.fullmatch(r"\d+", text) and (text == "0" or not text.startswith("0")):
+        return int(text)
+    if re.fullmatch(r"\d+\.0+", text) and not text.startswith("0"):
+        return int(float(text))
+    return value
+
+def clean_ito(value):
+    v = norm(value)
+    if "alcohol" in v: return "Alcohol"
+    if "e-cig" in v or "ecig" in v: return "E-Cig"
+    if "tobacco" in v or "cigarette" in v: return "Tobacco"
+    if "knife" in v or "bladed" in v: return "Knife"
+    if "online" in v or "click and collect" in v: return "Online"
+    return str(value or "").strip()
 
 def order_period_and_category(order_info):
     s = str(order_info or "")
@@ -171,22 +194,27 @@ def rows_from_source(audit_df, order_df, period_num, report_name, start_date, en
     orders["__period"] = orders["__period_category"].apply(lambda x: x[0])
     orders["__category"] = orders["__period_category"].apply(lambda x: x[1])
     orders["__ito_norm"] = orders.get("item_to_order", pd.Series("", index=orders.index)).map(norm)
-    orders = orders[~orders["__ito_norm"].isin(EXCLUDED_ITO)]
-    orders = orders[(orders["__period"] == int(period_num)) & (orders["__category"] == report_name)]
+    orders = orders[~orders["__ito_norm"].apply(lambda x: any(ex in x for ex in EXCLUDED_ITO))]
+    # order_info determines report allocation only; audit visit date determines reporting period.
+    orders = orders[orders["__category"] == report_name]
     # Use the order export as the allocation authority.
     order_cols = ["internal_id", "order_info", "item_to_order"]
-    orders = orders[order_cols].drop_duplicates("internal_id", keep="last")
-    audits = audits.merge(orders, left_on="order_internal_id", right_on="internal_id", how="inner", suffixes=("", "_order"))
-    if "item_to_order_order" in audits:
-        audits["item_to_order"] = audits["item_to_order_order"].combine_first(audits.get("item_to_order"))
-    audits = audits.drop(columns=[c for c in ["internal_id_order", "order_info", "item_to_order_order"] if c in audits.columns], errors="ignore")
+    orders = orders[order_cols].drop_duplicates("internal_id", keep="last").rename(
+        columns={"internal_id": "__matched_order_id", "item_to_order": "__order_ito"})
+    audits = audits.merge(orders, left_on="order_internal_id", right_on="__matched_order_id", how="inner")
+    if "__order_ito" in audits:
+        if "item_to_order" in audits:
+            audits["item_to_order"] = audits["__order_ito"].combine_first(audits["item_to_order"])
+        else:
+            audits["item_to_order"] = audits["__order_ito"]
+    audits = audits.drop(columns=[c for c in ["__matched_order_id", "order_info", "__order_ito"] if c in audits.columns], errors="ignore")
     audits["__visit"] = date_series(audits, "date_of_visit")
     start = pd.Timestamp(start_date)
     end = pd.Timestamp(end_date)
     audits = audits[(audits["__visit"] >= start) & (audits["__visit"] <= end)]
     # Global exclusions based on both order ITO and audit category.
     if "item_to_order" in audits:
-        audits = audits[~audits["item_to_order"].map(norm).isin(EXCLUDED_ITO)]
+        audits = audits[~audits["item_to_order"].map(norm).apply(lambda x: any(ex in x for ex in EXCLUDED_ITO))]
     # Map the first 14 fixed template columns, preserving their positions.
     columns = ["order_internal_id","client_name","internal_id","site_internal_id","site_name",
                "site_address_1","site_address_2","site_address_3","site_post_code",
@@ -196,6 +224,7 @@ def rows_from_source(audit_df, order_df, period_num, report_name, start_date, en
         out[c] = audits[c] if c in audits.columns else None
     for c in ["submitted_date","approval_date","date_of_visit"]:
         out[c] = pd.to_datetime(out[c], errors="coerce", dayfirst=True)
+    out["site_code"] = out["site_code"].apply(numeric_site_code)
     return out.drop_duplicates("internal_id", keep="last").reset_index(drop=True)
 
 def merge_ytd(existing_df, incoming_df):
@@ -280,25 +309,40 @@ def make_client_copy(live_path, client_path, keep_sheets):
     wb_formula.save(client_path)
 
 def update_input_orders(ws, orders):
-    # Order checklist area varies by template. Populate the existing 3-column order list
-    # when its header row can be identified, without inserting or moving columns.
-    for r in range(1, min(ws.max_row, 30)+1):
-        vals=[norm(ws.cell(r,c).value) for c in range(1,min(ws.max_column,20)+1)]
-        if any("order" in v for v in vals) and any("ito" in v or "item" in v for v in vals):
-            # only update contiguous order-list table if recognizable headers found
-            hdr = {norm(ws.cell(r,c).value): c for c in range(1, ws.max_column+1) if ws.cell(r,c).value}
-            order_col = next((c for h,c in hdr.items() if "order" in h), None)
-            type_col = next((c for h,c in hdr.items() if "type" in h or "schedule" in h), None)
-            ito_col = next((c for h,c in hdr.items() if "ito" in h or "item" in h), None)
-            if order_col and ito_col:
-                for rr in range(r+1, ws.max_row+1):
-                    for cc in {order_col,type_col,ito_col}:
-                        if cc: ws.cell(rr,cc).value = None
-                for i, (_, rec) in enumerate(orders.iterrows(), start=r+1):
-                    ws.cell(i,order_col).value=rec.get("internal_id")
-                    if type_col: ws.cell(i,type_col).value=rec.get("schedule_type")
-                    ws.cell(i,ito_col).value=rec.get("item_to_order")
-                return
+    """Refresh the order list in columns A:C below the 'Input' marker."""
+    marker_row = next((r for r in range(1, ws.max_row + 1)
+                       if norm(ws.cell(r, 1).value) == "input"), None)
+    if marker_row is None:
+        raise ValueError(f"Could not find the 'Input' marker in column A of {ws.title}.")
+    start_row = marker_row + 1
+    template_row = start_row
+    # Clear only order list columns A:C, preserving formulas in D onward.
+    for r in range(start_row, ws.max_row + 1):
+        for c in range(1, 4):
+            ws.cell(r, c).value = None
+
+    records = orders.copy()
+    if "internal_id" not in records.columns:
+        raise ValueError("Order export is missing internal_id.")
+    records = records.dropna(subset=["internal_id"]).drop_duplicates("internal_id", keep="last")
+    records["__type"] = records.get("schedule_type", pd.Series("", index=records.index)).map(
+        lambda x: "Revisit" if "revisit" in norm(x) else "Standard")
+    records["__ito"] = records.get("item_to_order", pd.Series("", index=records.index)).map(clean_ito)
+
+    for i, (_, rec) in enumerate(records.iterrows(), start=start_row):
+        if i > ws.max_row:
+            for c in range(1, ws.max_column + 1):
+                ws.cell(i, c)._style = copy(ws.cell(template_row, c)._style)
+                src = ws.cell(template_row, c)
+                if c >= 4 and isinstance(src.value, str) and src.value.startswith("="):
+                    try:
+                        ws.cell(i, c).value = Translator(src.value, origin=src.coordinate).translate_formula(ws.cell(i, c).coordinate)
+                    except Exception:
+                        ws.cell(i, c).value = src.value
+        ws.cell(i, 1).value = str(rec["internal_id"]).strip()
+        ws.cell(i, 2).value = rec["__type"]
+        ws.cell(i, 3).value = rec["__ito"]
+    return len(records)
 
 st.markdown("### Upload the source files and master store databases")
 col1,col2,col3=st.columns(3)
@@ -337,8 +381,13 @@ if st.button("Build all 3 reports (6 files)", type="primary", disabled=not all([
         order_df["__period"] = order_df["__allocation"].apply(lambda x:x[0])
         order_df["__category"] = order_df["__allocation"].apply(lambda x:x[1])
         order_df["__ito_norm"] = order_df.get("item_to_order", pd.Series("", index=order_df.index)).map(norm)
-        valid_orders=order_df[(order_df["__period"]==int(period_num)) & (~order_df["__ito_norm"].isin(EXCLUDED_ITO)) & order_df["__category"].notna()].copy()
-        st.info(f"Source audit rows: {len(audit_df):,}. Orders matching P{int(period_num)} allocation rules: {len(valid_orders):,}.")
+        valid_orders=order_df[(~order_df["__ito_norm"].apply(lambda x: any(ex in x for ex in EXCLUDED_ITO))) & order_df["__category"].notna()].copy()
+        # Build the current-period order list from audits whose visit dates fall in the selected period.
+        audit_dates = date_series(audit_df, "date_of_visit")
+        in_period_audits = audit_df[(audit_dates >= pd.Timestamp(start_date)) & (audit_dates <= pd.Timestamp(end_date))]
+        current_period_order_ids = set(in_period_audits["order_internal_id"].dropna().astype(str).str.strip())
+        valid_orders = valid_orders[valid_orders["internal_id"].astype(str).str.strip().isin(current_period_order_ids)]
+        st.info(f"Source audit rows: {len(audit_df):,}. Orders matched to audits visited in P{int(period_num)}: {len(valid_orders):,}.")
         templates={"Argos":argos_file,"Supermarket":super_file,"Convenience":conv_file}
         keep_sheets={
             "Argos":["Period Input","YTD Input","Summary","Zone Performance","Region 1 Performance","Region 2 Performance","Region 3 Performance","Region 4 Performance"],
@@ -359,7 +408,7 @@ if st.button("Build all 3 reports (6 files)", type="primary", disabled=not all([
                 write_input_rows(ytd_ws,new_ytd,14)
                 # Refresh order lists if a compatible three-column list exists.
                 report_orders=valid_orders[valid_orders["__category"]==report_name]
-                update_input_orders(wb["Input"], report_orders)
+                input_order_count = update_input_orders(wb["Input"], report_orders)
                 header_count = update_period_headers(wb, int(period_num))
                 live_name=f"Measure 25 Executive Report {REPORTS[report_name]['suffix']} - Period {int(period_num)} - LIVE.xlsx"
                 client_name=f"Measure 25 Executive Report {REPORTS[report_name]['suffix']} - Period {int(period_num)}.xlsx"
@@ -373,7 +422,7 @@ if st.button("Build all 3 reports (6 files)", type="primary", disabled=not all([
                     st.warning(f"{report_name}: Excel formulas were not recalculated by LibreOffice. Client copy will use cached values if available. {msg}")
                 make_client_copy(live_path,client_path,keep_sheets[report_name])
                 results.extend([(live_name,live_path),(client_name,client_path)])
-                st.write(f"**{report_name}:** {len(period_rows):,} period audits; {len(new_ytd):,} YTD records; {region_count:,} store records refreshed on Regions tab; {header_count:,} period headers updated.")
+                st.write(f"**{report_name}:** {len(period_rows):,} period audits; {len(new_ytd):,} YTD records; {region_count:,} store records refreshed on Regions tab; {input_order_count:,} orders written to Input; {header_count:,} period headers updated.")
             with zipfile.ZipFile(zipbuf,"w",zipfile.ZIP_DEFLATED) as zf:
                 for name,path in results: zf.write(path,arcname=name)
             zipbuf.seek(0)
