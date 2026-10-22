@@ -267,22 +267,49 @@ def update_period_headers(wb, period_num):
     return updated
 
 def recalc_with_libreoffice(path):
+    """Recalculate an XLSX in-place via a temporary LibreOffice round-trip."""
     soffice = shutil.which("libreoffice") or shutil.which("soffice")
     if not soffice:
-        return False, "LibreOffice was not found; formulas may not be recalculated automatically."
-    outdir = os.path.dirname(path)
+        return False, "LibreOffice is not installed. Add packages.txt with libreoffice-calc and redeploy."
     try:
-        proc = subprocess.run([soffice, "--headless", "--convert-to", "xlsx", "--outdir", outdir, path],
-                              capture_output=True, text=True, timeout=120)
-        # Conversion to same extension may be skipped; use isolated directory round-trip instead.
         with tempfile.TemporaryDirectory() as tmp:
-            proc = subprocess.run([soffice, "--headless", "--convert-to", "xlsx", "--outdir", tmp, path],
-                                  capture_output=True, text=True, timeout=180)
-            converted = os.path.join(tmp, os.path.basename(path))
-            if os.path.exists(converted):
+            profile = os.path.join(tmp, "lo-profile")
+            outdir = os.path.join(tmp, "converted")
+            os.makedirs(outdir, exist_ok=True)
+            # Isolate LibreOffice profile to avoid locked-profile errors in hosted environments.
+            cmd = [
+                soffice, "-env:UserInstallation=file://" + profile,
+                "--headless", "--convert-to", "xlsx",
+                "--outdir", outdir, path
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+            converted = os.path.join(outdir, os.path.basename(path))
+            if proc.returncode == 0 and os.path.exists(converted) and os.path.getsize(converted) > 0:
+                # Ensure output is a readable workbook before replacing the original.
+                test_wb = openpyxl.load_workbook(converted, data_only=False, read_only=True)
+                test_wb.close()
                 shutil.copy2(converted, path)
+                # Verify calculation produced cached values for formulas on Summary onwards.
+                value_wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+                formula_wb = openpyxl.load_workbook(path, data_only=False, read_only=True)
+                checked = 0
+                missing = 0
+                for ws in formula_wb.worksheets:
+                    if ws.title in {"Input", "Regions", "Period Input", "YTD Input"}:
+                        continue
+                    wsv = value_wb[ws.title]
+                    for row in ws.iter_rows():
+                        for cell in row:
+                            if isinstance(cell.value, str) and cell.value.startswith("="):
+                                checked += 1
+                                cached = wsv[cell.coordinate].value
+                                if cached is None or (isinstance(cached, str) and cached.startswith("#")):
+                                    missing += 1
+                formula_wb.close(); value_wb.close()
+                if checked and missing > max(3, int(checked * 0.02)):
+                    return False, f"LibreOffice converted the workbook but {missing} of {checked} formula cells still have blank/error cached results."
                 return True, proc.stdout + proc.stderr
-        return False, proc.stdout + proc.stderr
+            return False, (proc.stdout + proc.stderr or f"LibreOffice returned code {proc.returncode} without an output workbook.")
     except Exception as e:
         return False, str(e)
 

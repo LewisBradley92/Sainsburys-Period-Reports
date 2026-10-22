@@ -15,7 +15,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-LibreOffice is recommended for formula recalculation before converting formulas to values in the client-facing workbooks. If LibreOffice is unavailable, cached formula values may be stale.
+LibreOffice Calc is required for reliable formula recalculation before converting formulas to values in client-facing workbooks. The `packages.txt` file installs `libreoffice-calc` on Streamlit Community Cloud. Commit `packages.txt` and redeploy; allow the first build to finish installing the system package.
 
 ## Important
 The reporting period dates are entered manually in the UI for each run. Confirm the dates against the uploaded Sainsbury's calendar. This avoids assuming a calendar structure if the calendar layout changes.
