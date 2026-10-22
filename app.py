@@ -1,0 +1,375 @@
+import io, os, re, shutil, subprocess, tempfile, zipfile
+from datetime import datetime, date
+import pandas as pd
+import streamlit as st
+import openpyxl
+from openpyxl.formula.translate import Translator
+from copy import copy
+
+st.set_page_config(page_title="Sainsbury's / Argos Reporting", layout="wide")
+st.title("Sainsbury's / Argos Periodic Reporting")
+st.caption("Build Argos, Supermarket and Convenience LIVE and client-ready workbooks.")
+
+REPORTS = {
+    "Argos": {"template": "argos", "category": "Argos", "suffix": "Argos"},
+    "Supermarket": {"template": "super", "category": "Supermarket", "suffix": "Super"},
+    "Convenience": {"template": "conv", "category": "Convenience", "suffix": "Conv"},
+}
+EXCLUDED_ITO = {"compliance audit", "date check", "mystery shop", "petrol/diesel"}
+
+
+def sync_regions_tab(wb, report_name, master_upload, argos_master_upload):
+    """Refresh the report's Regions tab A:D from the appropriate master store database."""
+    if "Regions" not in wb.sheetnames:
+        raise ValueError(f"{report_name} workbook has no 'Regions' tab.")
+    if report_name == "Argos":
+        master_upload.seek(0)
+        src_wb = openpyxl.load_workbook(master_upload, data_only=True, read_only=True)
+        src_ws = src_wb["Argos Store Listing - Argos & S"]
+        # Regions A:D = Store Code, Region, District, Store Name
+        records = []
+        for row in src_ws.iter_rows(min_row=2, values_only=True):
+            store_code = row[0]   # A
+            store_name = row[2]   # C
+            region = row[6]       # G
+            district = row[7]     # H
+            if store_code is not None:
+                records.append((store_code, region, district, store_name))
+    else:
+        master_upload.seek(0)
+        src_wb = openpyxl.load_workbook(master_upload, data_only=True, read_only=True)
+        sheet_name = "Supermarket" if report_name == "Supermarket" else "Convenience"
+        src_ws = src_wb[sheet_name]
+        records = []
+        for row in src_ws.iter_rows(min_row=2, values_only=True):
+            if report_name == "Supermarket":
+                # Regions A:D = Region, Store Code, Store Name, Zone
+                store_code, store_name, zone, region = row[2], row[3], row[9], row[10]
+                rec = (region, store_code, store_name, zone)
+            else:
+                # Regions A:D = Zone, Region, Store Code, Store Name
+                store_code, store_name, zone, region = row[2], row[3], row[9], row[10]
+                rec = (zone, region, store_code, store_name)
+            if store_code is not None:
+                records.append(rec)
+    src_wb.close()
+
+    # Keep first row headers and replace the Regions data area with the current master listing.
+    ws = wb["Regions"]
+    for r in range(2, ws.max_row + 1):
+        for c in range(1, 5):
+            ws.cell(r, c).value = None
+    # De-duplicate on report store code while preserving source order.
+    deduped, seen = [], set()
+    for rec in records:
+        code = rec[0] if report_name == "Argos" else (rec[1] if report_name == "Supermarket" else rec[2])
+        key = norm(code)
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(rec)
+    for r, rec in enumerate(deduped, start=2):
+        for c, val in enumerate(rec, start=1):
+            ws.cell(r, c).value = val
+        if r > 2:
+            for c in range(1, 5):
+                ws.cell(r,c)._style = copy(ws.cell(2,c)._style)
+    ws.auto_filter.ref = f"A1:D{max(1, len(deduped)+1)}"
+    return len(deduped)
+
+def read_csv_upload(upload):
+    upload.seek(0)
+    return pd.read_csv(upload, low_memory=False, dtype={"order_internal_id": str, "internal_id": str})
+
+def norm(v):
+    return re.sub(r"\s+", " ", str(v or "")).strip().casefold()
+
+def order_period_and_category(order_info):
+    s = str(order_info or "")
+    m = re.match(r"^\s*P\s*(\d+)\s*-\s*(Argos|Supermarket|Convenience)\b", s, flags=re.I)
+    if not m:
+        return None, None
+    return int(m.group(1)), m.group(2).title()
+
+def date_series(df, col):
+    if col not in df.columns:
+        return pd.Series(pd.NaT, index=df.index)
+    return pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+
+def find_formula_row(ws, start_col=15):
+    for r in range(2, min(ws.max_row, 15) + 1):
+        if any(isinstance(ws.cell(r,c).value, str) and ws.cell(r,c).value.startswith("=") for c in range(start_col, ws.max_column+1)):
+            return r
+    return 2
+
+def clear_data_rows(ws, start_row=2):
+    # Clear cell contents but retain formatting and column positions.
+    for row in ws.iter_rows(min_row=start_row, max_row=ws.max_row, max_col=ws.max_column):
+        for cell in row:
+            cell.value = None
+
+def write_input_rows(ws, df, header_width=14):
+    # Capture formula prototypes before clearing existing data.
+    formula_row = find_formula_row(ws, header_width+1)
+    formula_prototypes = {}
+    for col in range(header_width+1, ws.max_column+1):
+        value = ws.cell(formula_row, col).value
+        if isinstance(value, str) and value.startswith("="):
+            formula_prototypes[col] = value
+    # Clear existing data and retain template styles.
+    clear_data_rows(ws, 2)
+    for idx, (_, rec) in enumerate(df.iterrows(), start=2):
+        for col in range(1, header_width+1):
+            value = rec.iloc[col-1] if col-1 < len(rec) else None
+            if pd.isna(value) if not isinstance(value, (list, dict)) else False:
+                value = None
+            if isinstance(value, pd.Timestamp):
+                value = value.to_pydatetime()
+            ws.cell(idx, col).value = value
+        # Extend existing helper formulas to the new row without changing column layout.
+        if idx != formula_row:
+            for col in range(header_width+1, ws.max_column+1):
+                src_formula = formula_prototypes.get(col)
+                if src_formula:
+                    try:
+                        ws.cell(idx, col).value = Translator(src_formula, origin=ws.cell(formula_row,col).coordinate).translate_formula(ws.cell(idx,col).coordinate)
+                    except Exception:
+                        ws.cell(idx, col).value = src_formula
+                else:
+                    ws.cell(idx,col)._style = copy(ws.cell(formula_row,col)._style)
+        # Copy row style from template row 2 across the input row.
+        if idx > 2:
+            for col in range(1, ws.max_column+1):
+                ws.cell(idx,col)._style = copy(ws.cell(2,col)._style)
+                if ws.cell(idx,col).value is None:
+                    pass
+    # remove stale rows below final record; cells cleared above already.
+    ws.auto_filter.ref = f"A1:{openpyxl.utils.get_column_letter(ws.max_column)}{max(2, len(df)+1)}"
+
+def rows_from_source(audit_df, order_df, period_num, report_name, start_date, end_date):
+    audits = audit_df.copy()
+    if "order_internal_id" not in audits or "internal_id" not in audits:
+        raise ValueError("Audit export must contain order_internal_id and internal_id.")
+    if "internal_id" not in order_df or "order_info" not in order_df:
+        raise ValueError("Order export must contain internal_id and order_info.")
+    orders = order_df.copy()
+    orders["__period_category"] = orders["order_info"].apply(order_period_and_category)
+    orders["__period"] = orders["__period_category"].apply(lambda x: x[0])
+    orders["__category"] = orders["__period_category"].apply(lambda x: x[1])
+    orders["__ito_norm"] = orders.get("item_to_order", pd.Series("", index=orders.index)).map(norm)
+    orders = orders[~orders["__ito_norm"].isin(EXCLUDED_ITO)]
+    orders = orders[(orders["__period"] == int(period_num)) & (orders["__category"] == report_name)]
+    # Use the order export as the allocation authority.
+    order_cols = ["internal_id", "order_info", "item_to_order"]
+    orders = orders[order_cols].drop_duplicates("internal_id", keep="last")
+    audits = audits.merge(orders, left_on="order_internal_id", right_on="internal_id", how="inner", suffixes=("", "_order"))
+    if "item_to_order_order" in audits:
+        audits["item_to_order"] = audits["item_to_order_order"].combine_first(audits.get("item_to_order"))
+    audits = audits.drop(columns=[c for c in ["internal_id_order", "order_info", "item_to_order_order"] if c in audits.columns], errors="ignore")
+    audits["__visit"] = date_series(audits, "date_of_visit")
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    audits = audits[(audits["__visit"] >= start) & (audits["__visit"] <= end)]
+    # Global exclusions based on both order ITO and audit category.
+    if "item_to_order" in audits:
+        audits = audits[~audits["item_to_order"].map(norm).isin(EXCLUDED_ITO)]
+    # Map the first 14 fixed template columns, preserving their positions.
+    columns = ["order_internal_id","client_name","internal_id","site_internal_id","site_name",
+               "site_address_1","site_address_2","site_address_3","site_post_code",
+               "submitted_date","approval_date","item_to_order","date_of_visit","site_code"]
+    out = pd.DataFrame()
+    for c in columns:
+        out[c] = audits[c] if c in audits.columns else None
+    for c in ["submitted_date","approval_date","date_of_visit"]:
+        out[c] = pd.to_datetime(out[c], errors="coerce", dayfirst=True)
+    return out.drop_duplicates("internal_id", keep="last").reset_index(drop=True)
+
+def merge_ytd(existing_df, incoming_df):
+    if existing_df.empty:
+        return incoming_df.copy()
+    # Match on audit internal_id. If the same audit appears again, keep the row with latest visit date.
+    all_rows = pd.concat([existing_df, incoming_df], ignore_index=True)
+    all_rows["__visit_sort"] = pd.to_datetime(all_rows.get("date_of_visit"), errors="coerce", dayfirst=True)
+    all_rows["__order"] = range(len(all_rows))
+    all_rows = all_rows.sort_values(["__visit_sort","__order"], na_position="first")
+    all_rows = all_rows.drop_duplicates(subset=["internal_id"], keep="last")
+    return all_rows.drop(columns=["__visit_sort","__order"], errors="ignore").reset_index(drop=True)
+
+def extract_existing_ytd(ws):
+    headers = [ws.cell(1,c).value for c in range(1,15)]
+    rows=[]
+    for r in range(2, ws.max_row+1):
+        vals=[ws.cell(r,c).value for c in range(1,15)]
+        if any(v is not None for v in vals) and vals[2] is not None:
+            rows.append(vals)
+    return pd.DataFrame(rows, columns=headers)
+
+
+def update_period_headers(wb, period_num):
+    """Update static period labels on report/output tabs without touching formulas or input tabs."""
+    pattern = re.compile(r"(?i)\bPeriod\s+\d+\b")
+    input_tabs = {"Input", "Regions", "Period Input", "YTD Input"}
+    updated = 0
+    for ws in wb.worksheets:
+        if ws.title in input_tabs:
+            continue
+        for row in ws.iter_rows():
+            for cell in row:
+                value = cell.value
+                if isinstance(value, str) and not value.startswith("=") and pattern.search(value):
+                    new_value = pattern.sub(f"Period {int(period_num)}", value)
+                    if new_value != value:
+                        cell.value = new_value
+                        updated += 1
+    return updated
+
+def recalc_with_libreoffice(path):
+    soffice = shutil.which("libreoffice") or shutil.which("soffice")
+    if not soffice:
+        return False, "LibreOffice was not found; formulas may not be recalculated automatically."
+    outdir = os.path.dirname(path)
+    try:
+        proc = subprocess.run([soffice, "--headless", "--convert-to", "xlsx", "--outdir", outdir, path],
+                              capture_output=True, text=True, timeout=120)
+        # Conversion to same extension may be skipped; use isolated directory round-trip instead.
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run([soffice, "--headless", "--convert-to", "xlsx", "--outdir", tmp, path],
+                                  capture_output=True, text=True, timeout=180)
+            converted = os.path.join(tmp, os.path.basename(path))
+            if os.path.exists(converted):
+                shutil.copy2(converted, path)
+                return True, proc.stdout + proc.stderr
+        return False, proc.stdout + proc.stderr
+    except Exception as e:
+        return False, str(e)
+
+def make_client_copy(live_path, client_path, keep_sheets):
+    # Requires LIVE file to have recalculated cached formula values before conversion.
+    wb_formula = openpyxl.load_workbook(live_path, data_only=False)
+    wb_values = openpyxl.load_workbook(live_path, data_only=True)
+    for sheet in list(wb_formula.sheetnames):
+        if sheet not in keep_sheets:
+            del wb_formula[sheet]
+    for sn in keep_sheets:
+        if sn not in wb_formula.sheetnames or sn not in wb_values.sheetnames:
+            continue
+        wsf, wsv = wb_formula[sn], wb_values[sn]
+        for row in wsf.iter_rows():
+            for cell in row:
+                if isinstance(cell.value, str) and cell.value.startswith("="):
+                    cell.value = wsv[cell.coordinate].value
+                elif hasattr(cell.value, "text") and hasattr(cell.value, "ref"):
+                    cell.value = wsv[cell.coordinate].value
+    wb_formula.calculation.fullCalcOnLoad = False
+    wb_formula.calculation.forceFullCalc = False
+    wb_formula.calculation.calcMode = "manual"
+    wb_formula.save(client_path)
+
+def update_input_orders(ws, orders):
+    # Order checklist area varies by template. Populate the existing 3-column order list
+    # when its header row can be identified, without inserting or moving columns.
+    for r in range(1, min(ws.max_row, 30)+1):
+        vals=[norm(ws.cell(r,c).value) for c in range(1,min(ws.max_column,20)+1)]
+        if any("order" in v for v in vals) and any("ito" in v or "item" in v for v in vals):
+            # only update contiguous order-list table if recognizable headers found
+            hdr = {norm(ws.cell(r,c).value): c for c in range(1, ws.max_column+1) if ws.cell(r,c).value}
+            order_col = next((c for h,c in hdr.items() if "order" in h), None)
+            type_col = next((c for h,c in hdr.items() if "type" in h or "schedule" in h), None)
+            ito_col = next((c for h,c in hdr.items() if "ito" in h or "item" in h), None)
+            if order_col and ito_col:
+                for rr in range(r+1, ws.max_row+1):
+                    for cc in {order_col,type_col,ito_col}:
+                        if cc: ws.cell(rr,cc).value = None
+                for i, (_, rec) in enumerate(orders.iterrows(), start=r+1):
+                    ws.cell(i,order_col).value=rec.get("internal_id")
+                    if type_col: ws.cell(i,type_col).value=rec.get("schedule_type")
+                    ws.cell(i,ito_col).value=rec.get("item_to_order")
+                return
+
+st.markdown("### Upload the source files and master store databases")
+col1,col2,col3=st.columns(3)
+with col1:
+    argos_file=st.file_uploader("Argos LIVE workbook", type=["xlsx"], key="argos")
+    super_file=st.file_uploader("Supermarket LIVE workbook", type=["xlsx"], key="super")
+with col2:
+    conv_file=st.file_uploader("Convenience LIVE workbook", type=["xlsx"], key="conv")
+    audit_file=st.file_uploader("Audit export CSV", type=["csv"], key="audit")
+with col3:
+    order_file=st.file_uploader("Order export CSV", type=["csv"], key="orders")
+    calendar_file=st.file_uploader("Sainsbury's calendar", type=["xlsx"], key="calendar")
+col4, col5 = st.columns(2)
+with col4:
+    sains_master_file = st.file_uploader("Sainsbury's Master Store Database", type=["xlsx"], key="sains_master")
+with col5:
+    argos_master_file = st.file_uploader("Argos Store Database", type=["xlsx"], key="argos_master")
+
+st.markdown("### Reporting period")
+pcol1,pcol2,pcol3=st.columns(3)
+with pcol1:
+    period_num=st.number_input("Period number", min_value=1, max_value=13, value=8, step=1)
+with pcol2:
+    start_date=st.date_input("Period start date", value=date(2026,10,1))
+with pcol3:
+    end_date=st.date_input("Period end date", value=date(2026,10,31))
+
+if start_date > end_date:
+    st.error("Period start date must be on or before the end date.")
+
+if st.button("Build all 3 reports (6 files)", type="primary", disabled=not all([argos_file,super_file,conv_file,audit_file,order_file,calendar_file,sains_master_file,argos_master_file]) or start_date>end_date):
+    try:
+        audit_df=read_csv_upload(audit_file)
+        order_df=read_csv_upload(order_file)
+        order_df["__allocation"] = order_df["order_info"].apply(order_period_and_category)
+        order_df["__period"] = order_df["__allocation"].apply(lambda x:x[0])
+        order_df["__category"] = order_df["__allocation"].apply(lambda x:x[1])
+        order_df["__ito_norm"] = order_df.get("item_to_order", pd.Series("", index=order_df.index)).map(norm)
+        valid_orders=order_df[(order_df["__period"]==int(period_num)) & (~order_df["__ito_norm"].isin(EXCLUDED_ITO)) & order_df["__category"].notna()].copy()
+        st.info(f"Source audit rows: {len(audit_df):,}. Orders matching P{int(period_num)} allocation rules: {len(valid_orders):,}.")
+        templates={"Argos":argos_file,"Supermarket":super_file,"Convenience":conv_file}
+        keep_sheets={
+            "Argos":["Period Input","YTD Input","Summary","Zone Performance","Region 1 Performance","Region 2 Performance","Region 3 Performance","Region 4 Performance"],
+            "Supermarket":["Period Input","YTD Input","Summary","Zone Performance","Zone North Performance","Zone Central Performance","Zone South Performance"],
+            "Convenience":["Period Input","YTD Input","Summary","Zone Performance","Zone Central Performance","Zone North Performance","Zone South Performance"],
+        }
+        zipbuf=io.BytesIO()
+        results=[]
+        with tempfile.TemporaryDirectory() as td:
+            for report_name, upload in templates.items():
+                period_rows=rows_from_source(audit_df, order_df, int(period_num), report_name, start_date, end_date)
+                wb=openpyxl.load_workbook(upload)
+                region_count = sync_regions_tab(wb, report_name, sains_master_file, argos_master_file)
+                period_ws=wb["Period Input"]; ytd_ws=wb["YTD Input"]
+                existing=extract_existing_ytd(ytd_ws)
+                new_ytd=merge_ytd(existing,period_rows)
+                write_input_rows(period_ws,period_rows,14)
+                write_input_rows(ytd_ws,new_ytd,14)
+                # Refresh order lists if a compatible three-column list exists.
+                report_orders=valid_orders[valid_orders["__category"]==report_name]
+                update_input_orders(wb["Input"], report_orders)
+                header_count = update_period_headers(wb, int(period_num))
+                live_name=f"Measure 25 Executive Report {REPORTS[report_name]['suffix']} - Period {int(period_num)} - LIVE.xlsx"
+                client_name=f"Measure 25 Executive Report {REPORTS[report_name]['suffix']} - Period {int(period_num)}.xlsx"
+                live_path=os.path.join(td,live_name); client_path=os.path.join(td,client_name)
+                wb.calculation.fullCalcOnLoad=True
+                wb.calculation.forceFullCalc=True
+                wb.calculation.calcMode="auto"
+                wb.save(live_path)
+                ok, msg=recalc_with_libreoffice(live_path)
+                if not ok:
+                    st.warning(f"{report_name}: Excel formulas were not recalculated by LibreOffice. Client copy will use cached values if available. {msg}")
+                make_client_copy(live_path,client_path,keep_sheets[report_name])
+                results.extend([(live_name,live_path),(client_name,client_path)])
+                st.write(f"**{report_name}:** {len(period_rows):,} period audits; {len(new_ytd):,} YTD records; {region_count:,} store records refreshed on Regions tab; {header_count:,} period headers updated.")
+            with zipfile.ZipFile(zipbuf,"w",zipfile.ZIP_DEFLATED) as zf:
+                for name,path in results: zf.write(path,arcname=name)
+            zipbuf.seek(0)
+            st.success("All six workbooks have been generated.")
+            st.download_button("Download all 6 workbooks (ZIP)", data=zipbuf.getvalue(),
+                               file_name=f"Sainsburys_Argos_Period_{int(period_num)}_Reports.zip",
+                               mime="application/zip")
+            for name,path in results:
+                with open(path,"rb") as f:
+                    st.download_button(f"Download {name}", data=f.read(), file_name=name,
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                       key="download_"+name)
+    except Exception as e:
+        st.exception(e)
