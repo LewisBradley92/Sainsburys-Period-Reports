@@ -286,41 +286,40 @@ def recalc_with_libreoffice(path):
     except Exception as e:
         return False, str(e)
 
-def make_client_copy(live_path, client_path, keep_sheets):
-    # Requires LIVE file to have recalculated cached formula values before conversion.
+def make_client_copy(live_path, client_path, keep_sheets, freeze_values=True):
+    # Only freeze formulas after a calculation engine has successfully recalculated the LIVE file.
     wb_formula = openpyxl.load_workbook(live_path, data_only=False)
-    wb_values = openpyxl.load_workbook(live_path, data_only=True)
+    if freeze_values:
+        wb_values = openpyxl.load_workbook(live_path, data_only=True)
+    else:
+        wb_values = None
     for sheet in list(wb_formula.sheetnames):
         if sheet not in keep_sheets:
             del wb_formula[sheet]
-    for sn in keep_sheets:
-        if sn not in wb_formula.sheetnames or sn not in wb_values.sheetnames:
-            continue
-        wsf, wsv = wb_formula[sn], wb_values[sn]
-        for row in wsf.iter_rows():
-            for cell in row:
-                if isinstance(cell.value, str) and cell.value.startswith("="):
-                    cell.value = wsv[cell.coordinate].value
-                elif hasattr(cell.value, "text") and hasattr(cell.value, "ref"):
-                    cell.value = wsv[cell.coordinate].value
-    wb_formula.calculation.fullCalcOnLoad = False
-    wb_formula.calculation.forceFullCalc = False
-    wb_formula.calculation.calcMode = "manual"
+    if wb_values is not None:
+        for sn in keep_sheets:
+            if sn not in wb_formula.sheetnames or sn not in wb_values.sheetnames:
+                continue
+            wsf, wsv = wb_formula[sn], wb_values[sn]
+            for row in wsf.iter_rows():
+                for cell in row:
+                    if isinstance(cell.value, str) and cell.value.startswith("="):
+                        cached = wsv[cell.coordinate].value
+                        # Never replace a formula with an empty/error cache.
+                        if cached is not None and not (isinstance(cached, str) and cached.startswith("#")):
+                            cell.value = cached
+    wb_formula.calculation.fullCalcOnLoad = True
+    wb_formula.calculation.forceFullCalc = True
+    wb_formula.calculation.calcMode = "auto"
     wb_formula.save(client_path)
 
 def update_input_orders(ws, orders):
-    """Refresh the order list in columns A:C below the 'Input' marker."""
+    """Append new order records to columns A:C without overwriting existing Input data."""
     marker_row = next((r for r in range(1, ws.max_row + 1)
                        if norm(ws.cell(r, 1).value) == "input"), None)
     if marker_row is None:
         raise ValueError(f"Could not find the 'Input' marker in column A of {ws.title}.")
     start_row = marker_row + 1
-    template_row = start_row
-    # Clear only order list columns A:C, preserving formulas in D onward.
-    for r in range(start_row, ws.max_row + 1):
-        for c in range(1, 4):
-            ws.cell(r, c).value = None
-
     records = orders.copy()
     if "internal_id" not in records.columns:
         raise ValueError("Order export is missing internal_id.")
@@ -329,20 +328,30 @@ def update_input_orders(ws, orders):
         lambda x: "Revisit" if "revisit" in norm(x) else "Standard")
     records["__ito"] = records.get("item_to_order", pd.Series("", index=records.index)).map(clean_ito)
 
-    for i, (_, rec) in enumerate(records.iterrows(), start=start_row):
-        if i > ws.max_row:
-            for c in range(1, ws.max_column + 1):
-                ws.cell(i, c)._style = copy(ws.cell(template_row, c)._style)
-                src = ws.cell(template_row, c)
-                if c >= 4 and isinstance(src.value, str) and src.value.startswith("="):
-                    try:
-                        ws.cell(i, c).value = Translator(src.value, origin=src.coordinate).translate_formula(ws.cell(i, c).coordinate)
-                    except Exception:
-                        ws.cell(i, c).value = src.value
+    # Preserve existing order rows. Add only order IDs that are not already listed.
+    existing_ids = set()
+    last_used = start_row - 1
+    for r in range(start_row, ws.max_row + 1):
+        current = ws.cell(r, 1).value
+        if current is not None and str(current).strip():
+            existing_ids.add(str(current).strip().casefold())
+            last_used = r
+    new_records = records[~records["internal_id"].astype(str).str.strip().str.casefold().isin(existing_ids)]
+    write_row = max(start_row, last_used + 1)
+    template_row = start_row
+    for i, (_, rec) in enumerate(new_records.iterrows(), start=write_row):
+        for c in range(1, ws.max_column + 1):
+            ws.cell(i, c)._style = copy(ws.cell(template_row, c)._style)
+            src = ws.cell(template_row, c)
+            if c >= 4 and isinstance(src.value, str) and src.value.startswith("="):
+                try:
+                    ws.cell(i, c).value = Translator(src.value, origin=src.coordinate).translate_formula(ws.cell(i, c).coordinate)
+                except Exception:
+                    ws.cell(i, c).value = src.value
         ws.cell(i, 1).value = str(rec["internal_id"]).strip()
         ws.cell(i, 2).value = rec["__type"]
         ws.cell(i, 3).value = rec["__ito"]
-    return len(records)
+    return len(new_records)
 
 st.markdown("### Upload the source files and master store databases")
 col1,col2,col3=st.columns(3)
@@ -420,7 +429,9 @@ if st.button("Build all 3 reports (6 files)", type="primary", disabled=not all([
                 ok, msg=recalc_with_libreoffice(live_path)
                 if not ok:
                     st.warning(f"{report_name}: Excel formulas were not recalculated by LibreOffice. Client copy will use cached values if available. {msg}")
-                make_client_copy(live_path,client_path,keep_sheets[report_name])
+                make_client_copy(live_path,client_path,keep_sheets[report_name],freeze_values=ok)
+                if not ok:
+                    st.warning(f"{report_name}: client copy retains formulas because recalculation was unavailable. This avoids exporting blank or #CALC! values. Open the workbook in Excel to calculate it; install/use LibreOffice in the deployment environment to produce a fully value-only client copy.")
                 results.extend([(live_name,live_path),(client_name,client_path)])
                 st.write(f"**{report_name}:** {len(period_rows):,} period audits; {len(new_ytd):,} YTD records; {region_count:,} store records refreshed on Regions tab; {input_order_count:,} orders written to Input; {header_count:,} period headers updated.")
             with zipfile.ZipFile(zipbuf,"w",zipfile.ZIP_DEFLATED) as zf:
