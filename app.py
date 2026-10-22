@@ -8,7 +8,7 @@ from copy import copy
 
 st.set_page_config(page_title="Sainsbury's / Argos Reporting", layout="wide")
 st.title("Sainsbury's / Argos Periodic Reporting")
-st.caption("Build Argos, Supermarket and Convenience LIVE and client-ready workbooks.")
+st.caption("Build Argos, Supermarket and Convenience LIVE workbooks only.")
 
 REPORTS = {
     "Argos": {"template": "argos", "category": "Argos", "suffix": "Argos"},
@@ -409,14 +409,20 @@ with pcol3:
 if start_date > end_date:
     st.error("Period start date must be on or before the end date.")
 
-if st.button("Build all 3 reports (6 files)", type="primary", disabled=not all([argos_file,super_file,conv_file,audit_file,order_file,calendar_file,sains_master_file,argos_master_file]) or start_date>end_date):
+fast_mode = st.checkbox(
+    "Fast mode — skip cloud formula recalculation (recommended)",
+    value=True,
+    help="Avoids the slow LibreOffice recalculation stage. LIVE workbooks retain formulas and recalculate when opened in Excel. Uncheck to attempt cloud recalculation, which may take much longer."
+)
+
+if st.button("Build all 3 LIVE reports (3 files)", type="primary", disabled=not all([argos_file,super_file,conv_file,audit_file,order_file,calendar_file,sains_master_file,argos_master_file]) or start_date>end_date):
     try:
         run_started = time.perf_counter()
         timings = []
         stage_status = st.empty()
         progress = st.progress(0, text="Starting report build…")
         stage_started = time.perf_counter()
-        stage_status.info("Stage 1/5 — Reading and matching audit/order exports…")
+        stage_status.info("Reading and matching audit/order exports…")
         audit_df=read_csv_upload(audit_file)
         order_df=read_csv_upload(order_file)
         order_df["__allocation"] = order_df["order_info"].apply(order_period_and_category)
@@ -432,17 +438,12 @@ if st.button("Build all 3 reports (6 files)", type="primary", disabled=not all([
         timings.append(("Read and match source exports", time.perf_counter() - stage_started))
         st.info(f"Source audit rows: {len(audit_df):,}. Orders matched to audits visited in P{int(period_num)}: {len(valid_orders):,}.")
         templates={"Argos":argos_file,"Supermarket":super_file,"Convenience":conv_file}
-        keep_sheets={
-            "Argos":["Period Input","YTD Input","Summary","Zone Performance","Region 1 Performance","Region 2 Performance","Region 3 Performance","Region 4 Performance"],
-            "Supermarket":["Period Input","YTD Input","Summary","Zone Performance","Zone North Performance","Zone Central Performance","Zone South Performance"],
-            "Convenience":["Period Input","YTD Input","Summary","Zone Performance","Zone Central Performance","Zone North Performance","Zone South Performance"],
-        }
         zipbuf=io.BytesIO()
         results=[]
         with tempfile.TemporaryDirectory() as td:
             for report_index, (report_name, upload) in enumerate(templates.items(), start=1):
                 report_started = time.perf_counter()
-                stage_status.info(f"Stage 2/5 — Updating {report_name} workbook ({report_index}/3)…")
+                stage_status.info(f"Updating {report_name} LIVE workbook ({report_index}/3)…")
                 progress.progress((report_index - 1) / 3, text=f"Preparing {report_name}…")
                 period_rows=rows_from_source(audit_df, order_df, int(period_num), report_name, start_date, end_date)
                 wb=openpyxl.load_workbook(upload)
@@ -457,47 +458,48 @@ if st.button("Build all 3 reports (6 files)", type="primary", disabled=not all([
                 input_order_count = update_input_orders(wb["Input"], report_orders)
                 header_count = update_period_headers(wb, int(period_num))
                 live_name=f"Measure 25 Executive Report {REPORTS[report_name]['suffix']} - Period {int(period_num)} - LIVE.xlsx"
-                client_name=f"Measure 25 Executive Report {REPORTS[report_name]['suffix']} - Period {int(period_num)}.xlsx"
-                live_path=os.path.join(td,live_name); client_path=os.path.join(td,client_name)
+                live_path=os.path.join(td,live_name)
                 wb.calculation.fullCalcOnLoad=True
                 wb.calculation.forceFullCalc=True
                 wb.calculation.calcMode="auto"
                 save_started = time.perf_counter()
                 wb.save(live_path)
                 save_seconds = time.perf_counter() - save_started
-                stage_status.info(f"Stage 3/5 — Recalculating {report_name} formulas with LibreOffice. This can be the slowest step…")
-                recalc_started = time.perf_counter()
-                ok, msg=recalc_with_libreoffice(live_path)
-                recalc_seconds = time.perf_counter() - recalc_started
                 timings.append((f"{report_name}: save LIVE workbook", save_seconds))
-                timings.append((f"{report_name}: formula recalculation", recalc_seconds))
-                if not ok:
-                    st.warning(f"{report_name}: Excel formulas were not recalculated by LibreOffice. Client copy will use cached values if available. {msg}")
-                stage_status.info(f"Stage 4/5 — Creating {report_name} client-facing copy…")
-                copy_started = time.perf_counter()
-                make_client_copy(live_path,client_path,keep_sheets[report_name],freeze_values=ok)
-                timings.append((f"{report_name}: client copy", time.perf_counter() - copy_started))
+                if fast_mode:
+                    ok = False
+                    msg = "Fast mode selected; cloud formula recalculation was skipped."
+                    timings.append((f"{report_name}: formula recalculation", 0.0))
+                    stage_status.info(f"Skipping cloud recalculation for {report_name} (fast mode)…")
+                else:
+                    stage_status.info(f"Recalculating {report_name} formulas with LibreOffice. This can be the slowest step…")
+                    recalc_started = time.perf_counter()
+                    ok, msg = recalc_with_libreoffice(live_path)
+                    recalc_seconds = time.perf_counter() - recalc_started
+                    timings.append((f"{report_name}: formula recalculation", recalc_seconds))
+                    if not ok:
+                        st.warning(f"{report_name}: LibreOffice recalculation was unsuccessful. {msg}")
                 timings.append((f"{report_name}: total report processing", time.perf_counter() - report_started))
                 progress.progress(report_index / 3, text=f"Finished {report_name} ({report_index}/3)")
                 if not ok:
-                    st.warning(f"{report_name}: client copy retains formulas because recalculation was unavailable. This avoids exporting blank or #CALC! values. Open the workbook in Excel to calculate it; install/use LibreOffice in the deployment environment to produce a fully value-only client copy.")
-                results.extend([(live_name,live_path),(client_name,client_path)])
+                    st.warning(f"{report_name}: cloud formula recalculation was skipped or unsuccessful. Open the LIVE workbook in Excel to recalculate formulas before relying on the displayed results. {msg}")
+                results.append((live_name,live_path))
                 st.write(f"**{report_name}:** {len(period_rows):,} period audits; {len(new_ytd):,} YTD records; {region_count:,} store records refreshed on Regions tab; {input_order_count:,} orders written to Input; {header_count:,} period headers updated.")
-            stage_status.info("Stage 5/5 — Packaging all six workbooks into a ZIP…")
+            stage_status.info("Stage 4/4 — Packaging the three LIVE workbooks into a ZIP…")
             zip_started = time.perf_counter()
             with zipfile.ZipFile(zipbuf,"w",zipfile.ZIP_DEFLATED) as zf:
                 for name,path in results: zf.write(path,arcname=name)
             zipbuf.seek(0)
-            timings.append(("Package six workbooks into ZIP", time.perf_counter() - zip_started))
+            timings.append(("Package three LIVE workbooks into ZIP", time.perf_counter() - zip_started))
             timings.append(("Total run", time.perf_counter() - run_started))
             progress.progress(1.0, text="Report build complete")
             stage_status.success("All processing stages completed.")
-            st.success("All six workbooks have been generated.")
+            st.success("All three LIVE workbooks have been generated.")
             with st.expander("Show processing timings"):
                 for label, seconds in timings:
                     st.write(f"**{label}:** {seconds:.1f} seconds")
-            st.download_button("Download all 6 workbooks (ZIP)", data=zipbuf.getvalue(),
-                               file_name=f"Sainsburys_Argos_Period_{int(period_num)}_Reports.zip",
+            st.download_button("Download all 3 LIVE workbooks (ZIP)", data=zipbuf.getvalue(),
+                               file_name=f"Sainsburys_Argos_Period_{int(period_num)}_LIVE_Reports.zip",
                                mime="application/zip")
             for name,path in results:
                 with open(path,"rb") as f:
