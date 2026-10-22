@@ -146,46 +146,66 @@ def clear_data_rows(ws, start_row=2):
             cell.value = None
 
 def write_input_rows(ws, df, header_width=14):
-    # Capture formula prototypes before clearing existing data.
-    formula_row = find_formula_row(ws, header_width+1)
-    formula_prototypes = {}
-    for col in range(header_width+1, ws.max_column+1):
+    """Replace input data while preserving every helper-column prototype.
+
+    The templates contain both formulas and literal helper values (for example,
+    the "pass" marker in column O), plus ArrayFormula cells in column W.
+    Rebuilding rows must restore all three kinds, not only ordinary formulas.
+    """
+    from openpyxl.worksheet.formula import ArrayFormula
+
+    formula_row = find_formula_row(ws, header_width + 1)
+    prototypes = {}
+    for col in range(header_width + 1, ws.max_column + 1):
         value = ws.cell(formula_row, col).value
-        if isinstance(value, str) and value.startswith("="):
-            formula_prototypes[col] = value
-    # Clear existing data and retain template styles.
+        if value is not None:
+            prototypes[col] = value
+
+    # Capture row style before clearing. Clearing data must not remove the
+    # template's literal helper markers or formula prototypes.
+    template_styles = [copy(ws.cell(2, c)._style) for c in range(1, ws.max_column + 1)]
     clear_data_rows(ws, 2)
+
     for idx, (_, rec) in enumerate(df.iterrows(), start=2):
-        for col in range(1, header_width+1):
-            value = rec.iloc[col-1] if col-1 < len(rec) else None
-            if pd.isna(value) if not isinstance(value, (list, dict)) else False:
-                value = None
+        for col in range(1, header_width + 1):
+            value = rec.iloc[col - 1] if col - 1 < len(rec) else None
+            if not isinstance(value, (list, dict)):
+                try:
+                    if pd.isna(value):
+                        value = None
+                except (TypeError, ValueError):
+                    pass
             if isinstance(value, pd.Timestamp):
                 value = value.to_pydatetime()
             ws.cell(idx, col).value = value
-        # Restore helper formulas on EVERY data row, including the prototype row.
-        # clear_data_rows() clears the original formulas too, so skipping formula_row
-        # leaves the first audit without helper keys/statuses and can break report tabs.
-        for col in range(header_width+1, ws.max_column+1):
-            src_formula = formula_prototypes.get(col)
-            if src_formula:
+
+        for col in range(header_width + 1, ws.max_column + 1):
+            target = ws.cell(idx, col)
+            proto = prototypes.get(col)
+            target._style = copy(template_styles[col - 1])
+            if proto is None:
+                target.value = None
+            elif isinstance(proto, ArrayFormula):
+                translated = proto.text
                 try:
-                    ws.cell(idx, col).value = Translator(
-                        src_formula,
-                        origin=ws.cell(formula_row, col).coordinate
-                    ).translate_formula(ws.cell(idx, col).coordinate)
+                    translated = Translator(
+                        proto.text, origin=ws.cell(formula_row, col).coordinate
+                    ).translate_formula(target.coordinate)
                 except Exception:
-                    ws.cell(idx, col).value = src_formula
-            else:
-                ws.cell(idx, col)._style = copy(ws.cell(formula_row, col)._style)
-        # Copy row style from template row 2 across the input row.
-        if idx > 2:
-            for col in range(1, ws.max_column+1):
-                ws.cell(idx,col)._style = copy(ws.cell(2,col)._style)
-                if ws.cell(idx,col).value is None:
                     pass
-    # remove stale rows below final record; cells cleared above already.
-    ws.auto_filter.ref = f"A1:{openpyxl.utils.get_column_letter(ws.max_column)}{max(2, len(df)+1)}"
+                target.value = ArrayFormula(ref=target.coordinate, text=translated)
+            elif isinstance(proto, str) and proto.startswith("="):
+                try:
+                    target.value = Translator(
+                        proto, origin=ws.cell(formula_row, col).coordinate
+                    ).translate_formula(target.coordinate)
+                except Exception:
+                    target.value = proto
+            else:
+                # Important: preserve literal helper values such as "pass".
+                target.value = proto
+
+    ws.auto_filter.ref = f"A1:{openpyxl.utils.get_column_letter(ws.max_column)}{max(2, len(df) + 1)}"
 
 def rows_from_source(audit_df, order_df, period_num, report_name, start_date, end_date):
     audits = audit_df.copy()
