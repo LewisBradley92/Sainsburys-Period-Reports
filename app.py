@@ -23,9 +23,24 @@ def sync_regions_tab(wb, report_name, master_upload, argos_master_upload):
     if "Regions" not in wb.sheetnames:
         raise ValueError(f"{report_name} workbook has no 'Regions' tab.")
     if report_name == "Argos":
-        master_upload.seek(0)
-        src_wb = openpyxl.load_workbook(master_upload, data_only=True, read_only=True)
-        src_ws = src_wb["Argos Store Listing - Argos & S"]
+        # Argos must use its own store database, not the Sainsbury's master.
+        argos_master_upload.seek(0)
+        src_wb = openpyxl.load_workbook(argos_master_upload, data_only=True, read_only=True)
+        expected_sheet = "Argos Store Listing - Argos & S"
+        if expected_sheet in src_wb.sheetnames:
+            src_ws = src_wb[expected_sheet]
+        else:
+            # Tolerate minor tab-name differences between database versions.
+            candidates = [name for name in src_wb.sheetnames
+                          if "argos" in name.casefold() and "store" in name.casefold()]
+            if not candidates:
+                available = ", ".join(src_wb.sheetnames)
+                src_wb.close()
+                raise ValueError(
+                    f"Could not find the Argos store-listing tab in the Argos database. "
+                    f"Available tabs: {available}"
+                )
+            src_ws = src_wb[candidates[0]]
         # Regions A:D = Store Code, Region, District, Store Name
         records = []
         for row in src_ws.iter_rows(min_row=2, values_only=True):
