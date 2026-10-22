@@ -4,6 +4,7 @@ import pandas as pd
 import streamlit as st
 import openpyxl
 from openpyxl.formula.translate import Translator
+from openpyxl.worksheet.formula import ArrayFormula
 from copy import copy
 
 st.set_page_config(page_title="Sainsbury's / Argos Reporting", layout="wide")
@@ -146,66 +147,57 @@ def clear_data_rows(ws, start_row=2):
             cell.value = None
 
 def write_input_rows(ws, df, header_width=14):
-    """Replace input data while preserving every helper-column prototype.
-
-    The templates contain both formulas and literal helper values (for example,
-    the "pass" marker in column O), plus ArrayFormula cells in column W.
-    Rebuilding rows must restore all three kinds, not only ordinary formulas.
-    """
-    from openpyxl.worksheet.formula import ArrayFormula
-
-    formula_row = find_formula_row(ws, header_width + 1)
-    prototypes = {}
-    for col in range(header_width + 1, ws.max_column + 1):
+    # Capture formula prototypes before clearing existing data.
+    formula_row = find_formula_row(ws, header_width+1)
+    formula_prototypes = {}
+    for col in range(header_width+1, ws.max_column+1):
         value = ws.cell(formula_row, col).value
-        if value is not None:
-            prototypes[col] = value
-
-    # Capture row style before clearing. Clearing data must not remove the
-    # template's literal helper markers or formula prototypes.
-    template_styles = [copy(ws.cell(2, c)._style) for c in range(1, ws.max_column + 1)]
+        if isinstance(value, str) and value.startswith("="):
+            formula_prototypes[col] = ("formula", value)
+        elif isinstance(value, ArrayFormula):
+            formula_prototypes[col] = ("array", value)
+    # Clear existing data and retain template styles.
     clear_data_rows(ws, 2)
-
     for idx, (_, rec) in enumerate(df.iterrows(), start=2):
-        for col in range(1, header_width + 1):
-            value = rec.iloc[col - 1] if col - 1 < len(rec) else None
-            if not isinstance(value, (list, dict)):
-                try:
-                    if pd.isna(value):
-                        value = None
-                except (TypeError, ValueError):
-                    pass
+        for col in range(1, header_width+1):
+            value = rec.iloc[col-1] if col-1 < len(rec) else None
+            if pd.isna(value) if not isinstance(value, (list, dict)) else False:
+                value = None
             if isinstance(value, pd.Timestamp):
                 value = value.to_pydatetime()
             ws.cell(idx, col).value = value
-
-        for col in range(header_width + 1, ws.max_column + 1):
-            target = ws.cell(idx, col)
-            proto = prototypes.get(col)
-            target._style = copy(template_styles[col - 1])
-            if proto is None:
-                target.value = None
-            elif isinstance(proto, ArrayFormula):
-                translated = proto.text
+        # Column O is the Q26 pass/fail marker. Preserve the source result per audit;
+        # never copy the template's first-row literal (usually "pass") to every record.
+        if ws.max_column >= 15 and "q26_result" in df.columns:
+            result = rec.get("q26_result")
+            ws.cell(idx, 15).value = result if result in ("pass", "fail") else (str(result).strip().casefold() if result is not None else None)
+        # Restore helper formulas on EVERY data row, including the prototype row.
+        # clear_data_rows() clears the original formulas too, so skipping formula_row
+        # leaves the first audit without helper keys/statuses and can break report tabs.
+        for col in range(header_width+1, ws.max_column+1):
+            prototype = formula_prototypes.get(col)
+            if prototype:
+                kind, src_formula = prototype
                 try:
-                    translated = Translator(
-                        proto.text, origin=ws.cell(formula_row, col).coordinate
-                    ).translate_formula(target.coordinate)
+                    origin = ws.cell(formula_row, col).coordinate
+                    target = ws.cell(idx, col).coordinate
+                    if kind == "formula":
+                        ws.cell(idx, col).value = Translator(src_formula, origin=origin).translate_formula(target)
+                    else:
+                        translated = Translator(src_formula.text, origin=origin).translate_formula(target)
+                        ws.cell(idx, col).value = ArrayFormula(ref=target, text=translated)
                 except Exception:
-                    pass
-                target.value = ArrayFormula(ref=target.coordinate, text=translated)
-            elif isinstance(proto, str) and proto.startswith("="):
-                try:
-                    target.value = Translator(
-                        proto, origin=ws.cell(formula_row, col).coordinate
-                    ).translate_formula(target.coordinate)
-                except Exception:
-                    target.value = proto
+                    ws.cell(idx, col).value = src_formula
             else:
-                # Important: preserve literal helper values such as "pass".
-                target.value = proto
-
-    ws.auto_filter.ref = f"A1:{openpyxl.utils.get_column_letter(ws.max_column)}{max(2, len(df) + 1)}"
+                ws.cell(idx, col)._style = copy(ws.cell(formula_row, col)._style)
+        # Copy row style from template row 2 across the input row.
+        if idx > 2:
+            for col in range(1, ws.max_column+1):
+                ws.cell(idx,col)._style = copy(ws.cell(2,col)._style)
+                if ws.cell(idx,col).value is None:
+                    pass
+    # remove stale rows below final record; cells cleared above already.
+    ws.auto_filter.ref = f"A1:{openpyxl.utils.get_column_letter(ws.max_column)}{max(2, len(df)+1)}"
 
 def rows_from_source(audit_df, order_df, period_num, report_name, start_date, end_date):
     audits = audit_df.copy()
@@ -246,15 +238,15 @@ def rows_from_source(audit_df, order_df, period_num, report_name, start_date, en
     out = pd.DataFrame()
     for c in columns:
         out[c] = audits[c] if c in audits.columns else None
-    # Q26 is a per-audit result, not a constant template marker. Populate it
-    # from the audit export so failed audits remain failed in Period and YTD.
-    out["Basic No ID logic (Q26)"] = (
-        audits["primary_result"].astype("string").str.strip().str.lower()
-        if "primary_result" in audits.columns else pd.Series(pd.NA, index=audits.index, dtype="string")
-    )
     for c in ["submitted_date","approval_date","date_of_visit"]:
         out[c] = pd.to_datetime(out[c], errors="coerce", dayfirst=True)
     out["site_code"] = out["site_code"].apply(numeric_site_code)
+    # Populate the Q26 helper from the audit export's recorded primary result.
+    # This prevents the template's literal "pass" in row 2 being copied to every audit.
+    if "primary_result" in audits.columns:
+        out["q26_result"] = audits["primary_result"].map(lambda x: str(x).strip().casefold() if pd.notna(x) else None)
+    else:
+        out["q26_result"] = None
     return out.drop_duplicates("internal_id", keep="last").reset_index(drop=True)
 
 def merge_ytd(existing_df, incoming_df):
@@ -269,10 +261,11 @@ def merge_ytd(existing_df, incoming_df):
     return all_rows.drop(columns=["__visit_sort","__order"], errors="ignore").reset_index(drop=True)
 
 def extract_existing_ytd(ws):
-    headers = [ws.cell(1,c).value for c in range(1,16)]
+    # Keep column O (Q26 pass/fail) so historical YTD outcomes are not discarded.
+    headers = [ws.cell(1,c).value for c in range(1,15)] + ["q26_result"]
     rows=[]
     for r in range(2, ws.max_row+1):
-        vals=[ws.cell(r,c).value for c in range(1,16)]
+        vals=[ws.cell(r,c).value for c in range(1,15)] + [ws.cell(r,15).value]
         if any(v is not None for v in vals) and vals[2] is not None:
             rows.append(vals)
     return pd.DataFrame(rows, columns=headers)
@@ -442,7 +435,7 @@ if start_date > end_date:
 fast_mode = st.checkbox(
     "Fast mode — skip slow cloud recalculation",
     value=True,
-    help="Avoids the slow LibreOffice recalculation stage. Formulas are retained and Excel recalculates when opened. Q26 pass/fail values are written from each audit's primary_result."
+    help="Avoids the slow LibreOffice recalculation stage. Formulas are retained and Excel recalculates when opened. The app also restores helper formulas on the first data row, which were previously being cleared."
 )
 
 if st.button("Build all 3 LIVE reports (3 files)", type="primary", disabled=not all([argos_file,super_file,conv_file,audit_file,order_file,calendar_file,sains_master_file,argos_master_file]) or start_date>end_date):
@@ -481,8 +474,8 @@ if st.button("Build all 3 LIVE reports (3 files)", type="primary", disabled=not 
                 period_ws=wb["Period Input"]; ytd_ws=wb["YTD Input"]
                 existing=extract_existing_ytd(ytd_ws)
                 new_ytd=merge_ytd(existing,period_rows)
-                write_input_rows(period_ws,period_rows,15)
-                write_input_rows(ytd_ws,new_ytd,15)
+                write_input_rows(period_ws,period_rows,14)
+                write_input_rows(ytd_ws,new_ytd,14)
                 # Refresh order lists if a compatible three-column list exists.
                 report_orders=valid_orders[valid_orders["__category"]==report_name]
                 input_order_count = update_input_orders(wb["Input"], report_orders)
