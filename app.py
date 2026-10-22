@@ -163,17 +163,21 @@ def write_input_rows(ws, df, header_width=14):
             if isinstance(value, pd.Timestamp):
                 value = value.to_pydatetime()
             ws.cell(idx, col).value = value
-        # Extend existing helper formulas to the new row without changing column layout.
-        if idx != formula_row:
-            for col in range(header_width+1, ws.max_column+1):
-                src_formula = formula_prototypes.get(col)
-                if src_formula:
-                    try:
-                        ws.cell(idx, col).value = Translator(src_formula, origin=ws.cell(formula_row,col).coordinate).translate_formula(ws.cell(idx,col).coordinate)
-                    except Exception:
-                        ws.cell(idx, col).value = src_formula
-                else:
-                    ws.cell(idx,col)._style = copy(ws.cell(formula_row,col)._style)
+        # Restore helper formulas on EVERY data row, including the prototype row.
+        # clear_data_rows() clears the original formulas too, so skipping formula_row
+        # leaves the first audit without helper keys/statuses and can break report tabs.
+        for col in range(header_width+1, ws.max_column+1):
+            src_formula = formula_prototypes.get(col)
+            if src_formula:
+                try:
+                    ws.cell(idx, col).value = Translator(
+                        src_formula,
+                        origin=ws.cell(formula_row, col).coordinate
+                    ).translate_formula(ws.cell(idx, col).coordinate)
+                except Exception:
+                    ws.cell(idx, col).value = src_formula
+            else:
+                ws.cell(idx, col)._style = copy(ws.cell(formula_row, col)._style)
         # Copy row style from template row 2 across the input row.
         if idx > 2:
             for col in range(1, ws.max_column+1):
@@ -410,9 +414,9 @@ if start_date > end_date:
     st.error("Period start date must be on or before the end date.")
 
 fast_mode = st.checkbox(
-    "Fast mode — skip cloud formula recalculation (recommended)",
+    "Fast mode — skip slow cloud recalculation",
     value=True,
-    help="Avoids the slow LibreOffice recalculation stage. LIVE workbooks retain formulas and recalculate when opened in Excel. Uncheck to attempt cloud recalculation, which may take much longer."
+    help="Avoids the slow LibreOffice recalculation stage. Formulas are retained and Excel recalculates when opened. The app also restores helper formulas on the first data row, which were previously being cleared."
 )
 
 if st.button("Build all 3 LIVE reports (3 files)", type="primary", disabled=not all([argos_file,super_file,conv_file,audit_file,order_file,calendar_file,sains_master_file,argos_master_file]) or start_date>end_date):
